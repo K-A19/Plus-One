@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
-  Eye, Check, X, Mic, MicOff, Plus, RefreshCw, LogIn, Github,
+  Eye, EyeOff, Check, X, Mic, MicOff, Plus, RefreshCw, LogIn, Github,
   Clock, Trash2, ChevronRight, Volume2, VolumeX, Loader, History, ArrowLeft, ExternalLink,
 } from "lucide-react";
 
@@ -157,6 +157,27 @@ async function callLLMRaw(prompt: string, maxTokens = 120): Promise<string> {
 // All callers go through the queue; rating calls give up on 429 rather than retry
 async function callGemini(prompt: string, maxTokens = 120): Promise<string> {
   return enqueue(() => callLLMRaw(prompt, maxTokens));
+}
+
+// Correct a raw speech transcript into a clean task item using surrounding context
+async function correctSpeechTranscript(raw: string, existingItems: string[]): Promise<string> {
+  const context = existingItems.length
+    ? existingItems.slice(0, 8).map((t) => `- ${t}`).join("\n")
+    : "none yet";
+  const prompt = `You are correcting a voice-to-text transcript for a hackathon task list.
+
+Existing tasks for context:
+${context}
+
+Raw transcript: "${raw}"
+
+The user was adding a new task item by voice. Speech recognition may have misheard words. Based on the existing tasks and common hackathon terminology, return ONLY the corrected task text — no quotes, no explanation, no prefix like "add" or "task:". Just the clean task name. If the transcript already makes sense, return it unchanged.`;
+  try {
+    const result = await enqueue(() => callLLMRaw(prompt, 60));
+    return result.trim() || raw;
+  } catch {
+    return raw;
+  }
 }
 
 // Single call returning both messages to halve request count
@@ -452,12 +473,35 @@ function archiveProject(setup: ProjectSetup, essentials: CheckItem[], custom: Ch
 // ─── Login ────────────────────────────────────────────────────────────────────
 
 function LoginScreen({ onNext }: { onNext: () => void }) {
+  const [blinking, setBlinking] = useState(false);
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout>;
+    function blink() {
+      setBlinking(true);
+      timeout = setTimeout(() => {
+        setBlinking(false);
+        timeout = setTimeout(blink, 2500 + Math.random() * 2500);
+      }, 150);
+    }
+    timeout = setTimeout(blink, 1000);
+    return () => clearTimeout(timeout);
+  }, []);
+
   return (
     <div className="min-h-screen flex items-center justify-center px-8" style={{ background: "#f2ede3", fontFamily: "'DM Sans', sans-serif" }}>
       <div className="w-full max-w-[340px] flex flex-col items-center gap-9">
         <div className="relative">
           <div className="w-24 h-24 rounded-full flex items-center justify-center" style={{ background: "#c8d8c0" }}>
-            <Eye size={36} strokeWidth={1.4} style={{ color: "#2c2722" }} />
+            <Eye
+              size={36}
+              strokeWidth={1.4}
+              style={{
+                color: "#2c2722",
+                transform: blinking ? "scaleY(0.08)" : "scaleY(1)",
+                transition: blinking ? "transform 0.06s ease-in" : "transform 0.09s ease-out",
+                display: "block",
+              }}
+            />
           </div>
           <div className="absolute top-3 right-3 w-3 h-3 rounded-full" style={{ background: "#6b8a6b" }} />
         </div>
@@ -471,8 +515,7 @@ function LoginScreen({ onNext }: { onNext: () => void }) {
         </div>
         <div className="w-full flex flex-col items-center gap-3">
           <button onClick={onNext} className="w-full flex items-center justify-center gap-2.5 rounded-2xl py-4 text-sm font-medium transition-opacity hover:opacity-90 active:opacity-80" style={{ background: "#2c2722", color: "#f2ede3" }}>
-            <LogIn size={16} strokeWidth={2} />
-            log in to get watched
+            add your plus one
           </button>
           <p className="text-xs italic" style={{ color: "#9a9088" }}>it&apos;s already judging your repo name.</p>
         </div>
@@ -579,7 +622,7 @@ function SetupScreen({ initial, onNext, onBack }: { initial: ProjectSetup | null
           <button onClick={() => canSubmit && onNext({ projectName: projectName.trim(), deadline, devpostUrl, githubUrl, tone: tone.trim(), checkInterval })} disabled={!canSubmit}
             className="w-full mt-1 py-4 rounded-xl text-sm font-medium transition-opacity"
             style={{ background: canSubmit ? "#2c2722" : "#c0b8ae", color: "#f2ede3", cursor: canSubmit ? "pointer" : "not-allowed" }}>
-            start watching
+            start getting watched
           </button>
         </div>
         <button onClick={onBack} className="mt-5 w-full text-center text-xs hover:opacity-70 transition-opacity" style={{ color: "#9a9088" }}>← back</button>
@@ -833,18 +876,29 @@ const [pasteToast, setPasteToast] = useState<string | null>(null);
         const t = e.results[0][a].transcript.trim();
         if (t.length > best.length) best = t;
       }
-      const item = best
+      const raw = best
         .replace(/^(add|at|and|had|add a|add an)\s+/i, "")
         .replace(/\s+to\s+(my\s+|the\s+)?list\s*$/i, "")
         .replace(/\s+on\s+(my\s+|the\s+)?list\s*$/i, "")
         .trim();
-      if (item.length > 1) {
-        const entry = makeEntry(item);
+      if (raw.length > 1) {
+        // Add optimistically with raw text, then correct in background
+        const entry = makeEntry(raw);
         setCustom([...customRef.current, entry]);
         rateAndUpdate([{ id: entry.id, text: entry.text }]);
-        setWakeToast(`added "${item}"`);
+        setWakeToast(`added "${raw}"`);
         if (wakeToastTimer.current) clearTimeout(wakeToastTimer.current);
         wakeToastTimer.current = setTimeout(() => setWakeToast(null), 3500);
+        // Correct the transcript using LLM context
+        const existingTexts = customRef.current.map((i) => i.text);
+        correctSpeechTranscript(raw, existingTexts).then((corrected) => {
+          if (corrected !== raw) {
+            setCustom((prev) => prev.map((i) => i.id === entry.id ? { ...i, text: corrected } : i));
+            setWakeToast(`added "${corrected}"`);
+            if (wakeToastTimer.current) clearTimeout(wakeToastTimer.current);
+            wakeToastTimer.current = setTimeout(() => setWakeToast(null), 3500);
+          }
+        });
       }
     };
     rec.onend = () => {
@@ -1611,6 +1665,7 @@ export default function App() {
   const { screen, setup, lastCheckIn, lastGitHubCheck } = state;
   const essentials = Array.isArray(state.essentials) ? state.essentials : ESSENTIALS_DEFAULT;
   const custom = Array.isArray(state.custom) ? state.custom : [];
+  const [isNewProject, setIsNewProject] = useState(!setup);
 
   const patch = useCallback((partial: Partial<AppState>) => {
     setState((prev) => { const next = { ...prev, ...partial }; saveState(next); return next; });
@@ -1620,8 +1675,8 @@ export default function App() {
   if (screen === "history") return <HistoryScreen onBack={() => patch({ screen: "dashboard" })} />;
   if (screen === "setup") return (
     <SetupScreen
-      initial={setup}
-      onNext={(s) => patch({ screen: "dashboard", setup: s })}
+      initial={isNewProject ? null : setup}
+      onNext={(s) => { setIsNewProject(false); patch({ screen: "dashboard", setup: s }); }}
       onBack={() => patch({ screen: setup ? "dashboard" : "login" })}
     />
   );
@@ -1643,6 +1698,7 @@ export default function App() {
       onExtendDeadline={(deadline) => patch({ setup: { ...setup, deadline } })}
       onReset={() => {
         archiveProject(setup, essentials, custom);
+        setIsNewProject(true);
         const fresh: AppState = { screen: "setup", setup, essentials: ESSENTIALS_DEFAULT, custom: [], lastCheckIn: null, lastGitHubCheck: null };
         saveState(fresh); setState(fresh);
       }}
